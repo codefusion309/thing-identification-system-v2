@@ -1,129 +1,62 @@
 """
-trainer.py - Model Training & Retraining
-CPU only mode.
-Optimized for any dataset size:
-  - Small  : ~20 images per class
-  - Medium : ~100 images per class
-  - Large  : 1000+ images per class
+trainer.py - Embedding Index Builder
+
+Replaces the full training pipeline with fast one-time embedding extraction.
+No epochs, no gradients, no optimizer, no augmentation.
+
+Each image is passed through the frozen MobileNetV2 backbone once.
+The mean embedding across all images in a class becomes that class's
+representative vector.
+
+Performance on CPU:
+  1000 classes x 25 images = 25,000 images
+  Estimated index build time : 10-20 minutes  (one-time only)
+  Per-correction update time : ~50ms          (instant, forever after)
 """
 
 import os
+import json
 import time
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader, random_split
+from PIL import Image
+from torchvision import transforms
 
-from model import build_model, save_model, get_device
+from model import load_backbone, get_embedding, get_device
 
 
 class Trainer:
-    def __init__(self, data_dir: str, model_path: str, classes_file: str):
-        self.data_dir     = data_dir
-        self.model_path   = model_path
-        self.classes_file = classes_file
-        self.device       = get_device()
+    def __init__(self, data_dir: str, embeddings_path: str, counts_path: str):
+        """
+        Args:
+            data_dir:        Path to folder of class subfolders (e.g. data/).
+            embeddings_path: Where to save the mean embeddings (e.g. saved_model/embeddings.pt).
+            counts_path:     Where to save image counts per class (e.g. saved_model/counts.json).
+        """
+        self.data_dir        = data_dir
+        self.embeddings_path = embeddings_path
+        self.counts_path     = counts_path
+        self.device          = get_device()
 
-    def get_dataset_scale(self, total_images: int, num_classes: int) -> str:
-        """
-        Determine dataset scale based on total images.
-          small  : avg < 50 images per class
-          medium : avg 50-500 images per class
-          large  : avg 500+ images per class
-        """
-        avg = total_images / max(num_classes, 1)
-        if avg < 50:
-            return "small"
-        elif avg < 500:
-            return "medium"
-        else:
-            return "large"
-
-    def get_train_transform(self, scale: str) -> transforms.Compose:
-        """
-        Data augmentation pipeline.
-        More aggressive augmentation for smaller datasets.
-        """
-        if scale == "small":
-            # Heavy augmentation to compensate for few images
-            return transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.RandomCrop(224),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomVerticalFlip(p=0.2),
-                transforms.RandomRotation(degrees=20),
-                transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.1),
-                transforms.RandomGrayscale(p=0.05),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-        elif scale == "medium":
-            # Moderate augmentation
-            return transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.RandomCrop(224),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=15),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-        else:
-            # Large dataset - light augmentation, data speaks for itself
-            return transforms.Compose([
-                transforms.Resize((256, 256)),
-                transforms.RandomCrop(224),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ])
-
-    def get_val_transform(self) -> transforms.Compose:
-        """No augmentation for validation."""
+    def get_transform(self) -> transforms.Compose:
+        """Standard ImageNet preprocessing. No augmentation needed."""
         return transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
         ])
 
-    def get_training_config(self, scale: str, total_images: int) -> dict:
-        """
-        Auto-tune training hyperparameters based on dataset scale.
-
-        Scale   | Epochs | Batch | LR     | Workers
-        --------|--------|-------|--------|--------
-        small   |   30   |   8   | 0.001  |   0
-        medium  |   20   |  32   | 0.001  |   0
-        large   |   10   |  64   | 0.0005 |   0
-        """
-        if scale == "small":
-            return {
-                "epochs"     : 30,
-                "batch_size" : 8,
-                "lr"         : 0.001,
-                "num_workers": 0
-            }
-        elif scale == "medium":
-            return {
-                "epochs"     : 20,
-                "batch_size" : 32,
-                "lr"         : 0.001,
-                "num_workers": 0
-            }
-        else:
-            # Large: fewer epochs needed, larger batches for efficiency
-            return {
-                "epochs"     : 10,
-                "batch_size" : 64,
-                "lr"         : 0.0005,
-                "num_workers": 0   # Keep 0 for Windows compatibility
-            }
-
     def validate_data(self):
-        """Check that the data folder has at least 2 classes with images."""
+        """
+        Check data/ folder has at least 2 class subfolders each with at least 1 image.
+        Only counts actual image files — ignores .DS_Store, README.txt, etc.
+        """
         if not os.path.exists(self.data_dir):
             raise FileNotFoundError(f"Data folder '{self.data_dir}' not found.")
+
+        valid_ext = {'.jpg', '.jpeg', '.png', '.bmp'}
 
         classes = [
             d for d in os.listdir(self.data_dir)
@@ -131,181 +64,100 @@ class Trainer:
         ]
 
         if len(classes) < 2:
-            raise ValueError(f"Need at least 2 classes, but found: {classes}")
+            raise ValueError(f"Need at least 2 class folders, found: {classes}")
 
         total_images = 0
         for cls in classes:
-            images = os.listdir(os.path.join(self.data_dir, cls))
+            images = [
+                f for f in os.listdir(os.path.join(self.data_dir, cls))
+                if os.path.splitext(f)[1].lower() in valid_ext
+            ]
             if len(images) == 0:
-                raise ValueError(f"Class '{cls}' has no images!")
+                raise ValueError(f"Class '{cls}' has no valid image files.")
             total_images += len(images)
             print(f"[Trainer] Class '{cls}': {len(images)} images")
 
-        print(f"[Trainer] Total images : {total_images}")
-        print(f"[Trainer] Total classes: {len(classes)}")
+        print(f"[Trainer] Total: {total_images} images across {len(classes)} classes")
         return classes, total_images
 
-    def train(self) -> float:
+    def build_index(self) -> dict:
         """
-        Train the model on images inside data_dir.
-        Auto-detects dataset scale and tunes hyperparameters accordingly.
-        Returns best accuracy (0.0 - 100.0).
+        Extract and store the mean embedding for every class in data/.
+
+        Steps:
+          1. Load pretrained MobileNetV2 backbone (from cache, no internet needed).
+          2. For every image: preprocess → forward pass → 1280-dim vector.
+          3. Average all vectors per class → one mean embedding per class.
+          4. Save embeddings.pt and counts.json to saved_model/.
+
+        Returns:
+            { class_name: image_count }  —  used for status reporting.
         """
-        print("[Trainer] -- Starting Training --")
-        print(f"[Trainer] Device: {self.device}")
+        print("[Trainer] -- Building Embedding Index --")
 
         classes, total_images = self.validate_data()
-        num_classes = len(classes)
+        transform             = self.get_transform()
+        valid_ext             = {'.jpg', '.jpeg', '.png', '.bmp'}
 
-        # Determine scale and config
-        scale  = self.get_dataset_scale(total_images, num_classes)
-        config = self.get_training_config(scale, total_images)
+        backbone = load_backbone()
+        backbone.to(self.device)
+        backbone.eval()
 
-        print(f"[Trainer] Dataset scale : {scale.upper()}")
-        print(f"[Trainer] Epochs        : {config['epochs']}")
-        print(f"[Trainer] Batch size    : {config['batch_size']}")
-        print(f"[Trainer] Learning rate : {config['lr']}")
+        class_embeddings = {}
+        class_counts     = {}
+        start_time       = time.time()
 
-        # Load dataset
-        full_dataset = datasets.ImageFolder(
-            root      = self.data_dir,
-            transform = self.get_train_transform(scale)
-        )
+        for i, class_name in enumerate(sorted(classes)):
+            class_dir   = os.path.join(self.data_dir, class_name)
+            image_files = [
+                f for f in os.listdir(class_dir)
+                if os.path.splitext(f)[1].lower() in valid_ext
+            ]
 
-        # Save class names
-        os.makedirs(os.path.dirname(self.classes_file), exist_ok=True)
-        with open(self.classes_file, "w") as f:
-            for cls in full_dataset.classes:
-                f.write(cls + "\n")
+            embeddings = []
+            skipped    = 0
 
-        # Train/Val split (80/20) if enough images
-        use_validation = total_images >= 20
+            for img_file in image_files:
+                img_path = os.path.join(class_dir, img_file)
+                try:
+                    image  = Image.open(img_path).convert("RGB")
+                    tensor = transform(image).unsqueeze(0).to(self.device)
+                    emb    = get_embedding(backbone, tensor).cpu()  # (1, 1280)
+                    embeddings.append(emb)
+                except Exception as e:
+                    print(f"[Trainer]   Skipped '{img_file}': {e}")
+                    skipped += 1
 
-        if use_validation:
-            val_size   = max(1, int(0.2 * total_images))
-            train_size = total_images - val_size
-            train_dataset, val_dataset = random_split(
-                full_dataset, [train_size, val_size]
+            if not embeddings:
+                print(f"[Trainer] WARNING: No valid images for '{class_name}', skipping.")
+                continue
+
+            mean_emb = torch.mean(torch.stack(embeddings), dim=0)  # (1, 1280)
+            class_embeddings[class_name] = mean_emb
+            class_counts[class_name]     = len(embeddings)
+
+            elapsed = time.time() - start_time
+            skip_note = f" ({skipped} skipped)" if skipped else ""
+            print(
+                f"[Trainer] [{i+1:>4}/{len(classes)}] '{class_name}': "
+                f"{len(embeddings)} embeddings{skip_note} | {elapsed:.1f}s elapsed"
             )
-            # Apply clean transform to val set
-            val_full = datasets.ImageFolder(
-                root      = self.data_dir,
-                transform = self.get_val_transform()
-            )
-            # Use same indices for val
-            from torch.utils.data import Subset
-            val_indices = val_dataset.indices
-            val_dataset = Subset(val_full, val_indices)
 
-            print(f"[Trainer] Train set : {train_size} images")
-            print(f"[Trainer] Val set   : {val_size} images")
-        else:
-            train_dataset = full_dataset
-            val_dataset   = None
+        if not class_embeddings:
+            raise ValueError("No embeddings were extracted. Check your data/ folder.")
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size  = config["batch_size"],
-            shuffle     = True,
-            num_workers = config["num_workers"],
-            pin_memory  = False
+        # Save to disk
+        os.makedirs(os.path.dirname(self.embeddings_path), exist_ok=True)
+        torch.save(class_embeddings, self.embeddings_path)
+
+        with open(self.counts_path, 'w') as f:
+            json.dump(class_counts, f, indent=2)
+
+        total_time = time.time() - start_time
+        print(
+            f"[Trainer] -- Index complete: "
+            f"{len(class_embeddings)} classes, "
+            f"{total_images} images, "
+            f"{total_time:.1f}s total --"
         )
-
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size  = config["batch_size"],
-            shuffle     = False,
-            num_workers = config["num_workers"],
-            pin_memory  = False
-        ) if val_dataset else None
-
-        # Build model and optimizer
-        model = build_model(num_classes)
-        model.to(self.device)
-
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        optimizer = optim.Adam(trainable_params, lr=config["lr"], weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
-        criterion = nn.CrossEntropyLoss()
-
-        best_accuracy  = 0.0
-        epochs         = config["epochs"]
-
-        for epoch in range(epochs):
-            epoch_start = time.time()
-
-            # -- Training --
-            model.train()
-            train_loss    = 0.0
-            train_correct = 0
-            train_total   = 0
-
-            for batch_idx, (images, labels) in enumerate(train_loader):
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-
-                optimizer.zero_grad()
-                outputs = model(images)
-                loss    = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-
-                train_loss    += loss.item()
-                _, predicted   = torch.max(outputs, 1)
-                train_correct += (predicted == labels).sum().item()
-                train_total   += labels.size(0)
-
-                # Progress indicator for large datasets
-                if scale == "large" and (batch_idx + 1) % 10 == 0:
-                    print(
-                        f"[Trainer]   Batch [{batch_idx+1}/{len(train_loader)}] "
-                        f"Loss: {loss.item():.4f}",
-                        end="\r"
-                    )
-
-            scheduler.step()
-            train_accuracy = (100.0 * train_correct / train_total) if train_total > 0 else 0.0
-            epoch_time     = time.time() - epoch_start
-
-            # -- Validation --
-            if val_loader:
-                model.eval()
-                val_correct = 0
-                val_total   = 0
-
-                with torch.no_grad():
-                    for images, labels in val_loader:
-                        images = images.to(self.device)
-                        labels = labels.to(self.device)
-                        outputs = model(images)
-                        _, predicted = torch.max(outputs, 1)
-                        val_correct += (predicted == labels).sum().item()
-                        val_total   += labels.size(0)
-
-                val_accuracy = (100.0 * val_correct / val_total) if val_total > 0 else 0.0
-
-                print(
-                    f"[Trainer] Epoch [{epoch+1:>3}/{epochs}] "
-                    f"Loss: {train_loss:.4f} | "
-                    f"Train: {train_accuracy:.1f}% | "
-                    f"Val: {val_accuracy:.1f}% | "
-                    f"Time: {epoch_time:.1f}s"
-                )
-
-                if val_accuracy >= best_accuracy:
-                    best_accuracy = val_accuracy
-                    save_model(model, self.model_path)
-            else:
-                print(
-                    f"[Trainer] Epoch [{epoch+1:>3}/{epochs}] "
-                    f"Loss: {train_loss:.4f} | "
-                    f"Accuracy: {train_accuracy:.1f}% | "
-                    f"Time: {epoch_time:.1f}s"
-                )
-
-                if train_accuracy >= best_accuracy:
-                    best_accuracy = train_accuracy
-                    save_model(model, self.model_path)
-
-        print(f"[Trainer] -- Training Complete! Best Accuracy: {best_accuracy:.1f}% --")
-        return best_accuracy
+        return class_counts
