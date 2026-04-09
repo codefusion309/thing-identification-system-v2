@@ -27,7 +27,9 @@ def load_backbone() -> nn.Module:
     After that:    loads instantly from local cache (~/.cache/torch/).
     Offline use:   pre-cache the weights before going offline (see README).
     """
-    model = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.DEFAULT)
+    model = models.mobilenet_v2(weights=None)  # don't auto-download
+    state = torch.load("mobilenet_v2_weights.pth", map_location="cpu")
+    model.load_state_dict(state)
 
     for param in model.parameters():
         param.requires_grad = False
